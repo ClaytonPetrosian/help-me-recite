@@ -1,19 +1,20 @@
 import Colors from "@/constants/colors";
 import { useProgress } from "@/contexts/ProgressContext";
 import { useVocabulary } from "@/contexts/VocabularyContext";
-import { Audio } from "expo-av";
+import { Audio, InterruptionModeAndroid } from "expo-av";
 import { router } from "expo-router";
 import * as Speech from "expo-speech";
 import { Check, ChevronRight, Mic, Volume2, X } from "lucide-react-native";
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
-    Alert,
-    Animated,
-    Platform,
-    StyleSheet,
-    Text,
-    TouchableOpacity,
-    View,
+  Alert,
+  Animated,
+  Linking,
+  Platform,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -22,13 +23,22 @@ export default function PracticeScreen() {
   const { words, addToReview, removeFromReview } = useVocabulary();
   const { updateProgress } = useProgress();
   
+  // 使用你代码中的 Key
+  const SILICONFLOW_API_KEY = "sk-yyydqxkptalspyqyjfzdmhqqcecbdrbapjydsdpgrbxppbkr"; 
+
   const [currentIndex, setCurrentIndex] = useState<number>(0);
   const [userInput, setUserInput] = useState<string>("");
   const [isListening, setIsListening] = useState<boolean>(false);
   const [feedback, setFeedback] = useState<"correct" | "incorrect" | null>(null);
   const [scaleAnim] = useState(new Animated.Value(1));
+  
+  // 录音相关状态
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
   const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(null);
+  
+  // Refs 用于清理和防止闭包陷阱
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const recordingRef = useRef<Audio.Recording | null>(null);
 
   const currentWord = words[currentIndex];
 
@@ -36,7 +46,37 @@ export default function PracticeScreen() {
     if (currentWord) {
       speakDefinitions();
     }
+    // 页面卸载时强制清理
+    return () => {
+      cleanupRecording();
+    };
   }, [currentIndex]);
+
+  // 独立的清理函数
+  const cleanupRecording = async () => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    
+    // 无论 react state 如何，优先清理 ref 中的实例
+    const recordingToUnload = recordingRef.current;
+    if (recordingToUnload) {
+      try {
+        const status = await recordingToUnload.getStatusAsync();
+        if (status.isLoaded) {
+          await recordingToUnload.stopAndUnloadAsync();
+        }
+      } catch (error) {
+        // 忽略清理时的错误，通常是因为已经卸载了
+        console.log("Cleanup log:", error);
+      }
+      recordingRef.current = null;
+    }
+    
+    setIsListening(false);
+    setRecording(null);
+  };
 
   const speakDefinitions = () => {
     if (!currentWord) return;
@@ -52,46 +92,71 @@ export default function PracticeScreen() {
   };
 
   const transcribeAudio = async (audioUri: string): Promise<string> => {
+    const url = 'https://api.siliconflow.cn/v1/audio/transcriptions';
+    
     try {
-      const formData = new FormData();
-      
+      const form = new FormData();
+      form.append('model', 'FunAudioLLM/SenseVoiceSmall');
+
       if (Platform.OS === "web") {
         const response = await fetch(audioUri);
         const blob = await response.blob();
-        formData.append("audio", blob, "recording.webm");
+        form.append("file", blob, "recording.webm");
       } else {
         const uriParts = audioUri.split(".");
         const fileType = uriParts[uriParts.length - 1];
         
+        let finalUri = audioUri;
+        if (Platform.OS === 'android' && !finalUri.startsWith('file://')) {
+            finalUri = 'file://' + finalUri;
+        }
+
+        // 简单的 MIME 类型映射
+        let mimeType = "audio/webm"; // 默认 webm
+        if (fileType === "wav") mimeType = "audio/wav";
+        else if (fileType === "m4a") mimeType = "audio/mp4";
+
         const audioFile = {
-          uri: audioUri,
+          uri: finalUri,
           name: "recording." + fileType,
-          type: "audio/" + fileType,
+          type: mimeType,
         } as any;
         
-        formData.append("audio", audioFile);
+        form.append("file", audioFile);
       }
-      
-      const response = await fetch("https://toolkit.rork.com/stt/transcribe/", {
-        method: "POST",
-        body: formData,
+
+      console.log("发送转录请求...");
+      const response = await fetch(url, {
+        method: 'POST', 
+        headers: { Authorization: `Bearer ${SILICONFLOW_API_KEY}` },
+        body: form
       });
       
-      if (!response.ok) {
-        throw new Error("转录失败");
-      }
-      
-      const data = await response.json();
+      const responseText = await response.text();
+      if (!response.ok) throw new Error(`API Error: ${responseText}`);
+
+      const data = JSON.parse(responseText);
+      if (!data.text) return "";
       return data.text.toLowerCase().trim();
+
     } catch (error) {
-      console.error("转录错误:", error);
+      console.error("Transcribe Error:", error);
+      if (error instanceof Error) Alert.alert("识别失败", error.message);
       throw error;
     }
   };
 
-  const handleStartListening = async () => {
+  const handleToggleListening = async () => {
     if (!currentWord) return;
-    
+
+    if (isListening) {
+      await handleStopListening();
+    } else {
+      await startRecording();
+    }
+  };
+
+  const startRecording = async () => {
     try {
       if (Platform.OS === "web") {
         await startWebRecording();
@@ -99,35 +164,69 @@ export default function PracticeScreen() {
         await startNativeRecording();
       }
     } catch (error) {
-      console.error("开始录音失败:", error);
-      Alert.alert("错误", "无法开始录音，请检查麦克风权限");
-      setIsListening(false);
+      console.error("Start Error:", error);
+      await cleanupRecording();
+      
+      // 只有非权限错误才弹窗，权限错误在 startNativeRecording 里处理了
+      if (!(error as any)?.message?.includes("permissions")) {
+         Alert.alert("录音启动失败", "请重试或重启 App");
+      }
     }
   };
 
   const startNativeRecording = async () => {
+    // 1. 权限检查
+    let permResponse = await Audio.getPermissionsAsync();
+    if (permResponse.status !== 'granted' && permResponse.canAskAgain) {
+      permResponse = await Audio.requestPermissionsAsync();
+    }
+
+    if (permResponse.status !== 'granted') {
+      Alert.alert(
+        "无法访问麦克风",
+        "请在设置中允许应用访问麦克风。",
+        [
+          { text: "取消", style: "cancel" },
+          { text: "去设置", onPress: () => Linking.openSettings() }
+        ]
+      );
+      return;
+    }
+
+    // 2. 彻底清理旧资源
+    await cleanupRecording();
+
     try {
-      await Audio.requestPermissionsAsync();
+      // 3. 设置音频模式
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
         playsInSilentModeIOS: true,
+        staysActiveInBackground: false,
+        interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
       });
 
-      const { recording: newRecording } = await Audio.Recording.createAsync({
+      // 4. 实例化新的 Recording 对象
+      const newRecording = new Audio.Recording();
+
+      // 5. 准备录音参数
+      // 【关键修复】移除 Android 的 sampleRate 和 bitRate，让系统自动选择最佳参数
+      // 这解决了 "recording not started" 的核心兼容性问题
+      await newRecording.prepareToRecordAsync({
         android: {
-          extension: ".m4a",
-          outputFormat: Audio.AndroidOutputFormat.MPEG_4,
-          audioEncoder: Audio.AndroidAudioEncoder.AAC,
-          sampleRate: 44100,
-          numberOfChannels: 2,
-          bitRate: 128000,
+          extension: ".webm",
+          outputFormat: Audio.AndroidOutputFormat.WEBM,
+          audioEncoder: Audio.AndroidAudioEncoder.VORBIS,
+          // 不要手动指定 sampleRate/bitRate/numberOfChannels
+          // 让 Android 底层自己决定
         },
         ios: {
           extension: ".wav",
           outputFormat: Audio.IOSOutputFormat.LINEARPCM,
           audioQuality: Audio.IOSAudioQuality.HIGH,
           sampleRate: 44100,
-          numberOfChannels: 2,
+          numberOfChannels: 1,
           bitRate: 128000,
           linearPCMBitDepth: 16,
           linearPCMIsBigEndian: false,
@@ -139,44 +238,72 @@ export default function PracticeScreen() {
         },
       });
 
+      // 6. 启动录音
+      await newRecording.startAsync();
+
+      // 7. 更新状态
       setRecording(newRecording);
+      recordingRef.current = newRecording;
       setIsListening(true);
       setUserInput("");
 
-      setTimeout(async () => {
+      // 8. 启动自动停止计时器
+      timerRef.current = setTimeout(async () => {
         await stopNativeRecording(newRecording);
       }, 3000);
-    } catch (error) {
-      console.error("Native录音失败:", error);
-      throw error;
+
+    } catch (err) {
+      console.error("Native Start Failed:", err);
+      throw err;
     }
   };
 
   const stopNativeRecording = async (recordingInstance: Audio.Recording) => {
+    // 清除定时器
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+
     try {
+      // 停止并卸载
       await recordingInstance.stopAndUnloadAsync();
+      const uri = recordingInstance.getURI();
+      
+      // 状态重置
+      setIsListening(false);
+      setRecording(null);
+      recordingRef.current = null;
+
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: false,
       });
 
-      const uri = recordingInstance.getURI();
-      if (!uri) {
-        throw new Error("录音URI为空");
+      if (uri) {
+        const recognized = await transcribeAudio(uri);
+        setUserInput(recognized);
+        checkAnswer(recognized);
       }
-
-      const recognized = await transcribeAudio(uri);
-      setUserInput(recognized);
-      setIsListening(false);
-      checkAnswer(recognized);
     } catch (error) {
-      console.error("停止录音失败:", error);
-      Alert.alert("错误", "语音识别失败，请重试");
+      console.error("Stop Error:", error);
       setIsListening(false);
-    } finally {
-      setRecording(null);
     }
   };
 
+  const handleStopListening = async () => {
+    if (Platform.OS === "web") {
+      if (mediaRecorder && mediaRecorder.state === "recording") {
+        mediaRecorder.stop();
+      }
+    } else {
+      const target = recordingRef.current || recording;
+      if (target) {
+        await stopNativeRecording(target);
+      }
+    }
+  };
+
+  // ... Web 录音保持不变 ...
   const startWebRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -187,26 +314,21 @@ export default function PracticeScreen() {
       const chunks: Blob[] = [];
 
       recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) {
-          chunks.push(e.data);
-        }
+        if (e.data.size > 0) chunks.push(e.data);
       };
 
       recorder.onstop = async () => {
         stream.getTracks().forEach((track) => track.stop());
-        
         const blob = new Blob(chunks, { type: mimeType });
         const url = URL.createObjectURL(blob);
-        
         try {
+          setIsListening(false);
           const recognized = await transcribeAudio(url);
           setUserInput(recognized);
-          setIsListening(false);
           checkAnswer(recognized);
         } catch (error) {
           console.error("Web转录失败:", error);
-          Alert.alert("错误", "语音识别失败，请重试");
-          setIsListening(false);
+          Alert.alert("错误", "语音识别失败");
         } finally {
           URL.revokeObjectURL(url);
         }
@@ -217,11 +339,11 @@ export default function PracticeScreen() {
       setIsListening(true);
       setUserInput("");
 
-      setTimeout(() => {
-        if (recorder.state === "recording") {
-          recorder.stop();
-        }
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => {
+        if (recorder.state === "recording") recorder.stop();
       }, 3000);
+
     } catch (error) {
       console.error("Web录音失败:", error);
       throw error;
@@ -230,47 +352,30 @@ export default function PracticeScreen() {
 
   const checkAnswer = async (input: string) => {
     if (!currentWord) return;
-
     const normalizedInput = input.toLowerCase().trim().replace(/[^a-z]/g, "");
     const normalizedWord = currentWord.word.toLowerCase().trim().replace(/[^a-z]/g, "");
     
     const isCorrect = normalizedInput === normalizedWord;
     setFeedback(isCorrect ? "correct" : "incorrect");
-
-    await updateProgress({
-      correct: isCorrect,
-      wordId: currentWord.id,
-    });
+    await updateProgress({ correct: isCorrect, wordId: currentWord.id });
 
     if (!isCorrect) {
       await addToReview(currentWord.id);
-      Speech.speak(currentWord.word, {
-        language: "en-US",
-        pitch: 1,
-        rate: 0.8,
-      });
+      Speech.speak(currentWord.word, { language: "en-US", pitch: 1, rate: 0.8 });
     } else {
       await removeFromReview(currentWord.id);
     }
 
     Animated.sequence([
-      Animated.timing(scaleAnim, {
-        toValue: 1.2,
-        duration: 200,
-        useNativeDriver: true,
-      }),
-      Animated.timing(scaleAnim, {
-        toValue: 1,
-        duration: 200,
-        useNativeDriver: true,
-      }),
+      Animated.timing(scaleAnim, { toValue: 1.2, duration: 200, useNativeDriver: true }),
+      Animated.timing(scaleAnim, { toValue: 1, duration: 200, useNativeDriver: true }),
     ]).start();
   };
 
-  const handleNext = () => {
+  const handleNextManually = () => {
+    if (feedback === null) return;
     setFeedback(null);
     setUserInput("");
-    
     if (currentIndex < words.length - 1) {
       setCurrentIndex(currentIndex + 1);
     } else {
@@ -278,22 +383,12 @@ export default function PracticeScreen() {
     }
   };
 
-  const handleNextManually = () => {
-    if (feedback === null) return;
-    setFeedback(null);
-    setUserInput("");
-    handleNext();
-  };
-
   if (!currentWord) {
     return (
       <View style={[styles.container, { paddingTop: insets.top }]}>
         <View style={styles.emptyContainer}>
           <Text style={styles.emptyText}>没有可练习的单词</Text>
-          <TouchableOpacity
-            style={styles.backButton}
-            onPress={() => router.back()}
-          >
+          <TouchableOpacity style={styles.backButton} onPress={() => router.back()}>
             <Text style={styles.backButtonText}>返回</Text>
           </TouchableOpacity>
         </View>
@@ -304,9 +399,7 @@ export default function PracticeScreen() {
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
       <View style={styles.header}>
-        <Text style={styles.progress}>
-          {currentIndex + 1} / {words.length}
-        </Text>
+        <Text style={styles.progress}>{currentIndex + 1} / {words.length}</Text>
         <TouchableOpacity 
           onPress={handleNextManually}
           disabled={feedback === null}
@@ -324,11 +417,7 @@ export default function PracticeScreen() {
             <TouchableOpacity
               style={styles.pronunciationButton}
               onPress={() => {
-                Speech.speak(currentWord.word, {
-                  language: "en-US",
-                  pitch: 1,
-                  rate: 0.8,
-                });
+                Speech.speak(currentWord.word, { language: "en-US", pitch: 1, rate: 0.8 });
               }}
             >
               <Volume2 size={20} color={Colors.accent} />
@@ -340,9 +429,7 @@ export default function PracticeScreen() {
         <View style={styles.definitionsContainer}>
           <Text style={styles.definitionsLabel}>释义：</Text>
           {currentWord.definitions.slice(0, 3).map((def, index) => (
-            <Text key={index} style={styles.definition}>
-              • {def}
-            </Text>
+            <Text key={index} style={styles.definition}>• {def}</Text>
           ))}
         </View>
 
@@ -360,8 +447,8 @@ export default function PracticeScreen() {
               feedback === "correct" && styles.correctButton,
               feedback === "incorrect" && styles.incorrectButton,
             ]}
-            onPress={handleStartListening}
-            disabled={isListening || feedback !== null}
+            onPress={handleToggleListening}
+            disabled={feedback !== null}
           >
             {feedback === "correct" ? (
               <Check size={48} color={Colors.background} />
@@ -373,7 +460,7 @@ export default function PracticeScreen() {
           </TouchableOpacity>
           <Text style={styles.micText}>
             {isListening
-              ? "正在识别..."
+              ? "正在录音 (点击停止)..." 
               : feedback === "correct"
               ? "正确！"
               : feedback === "incorrect"

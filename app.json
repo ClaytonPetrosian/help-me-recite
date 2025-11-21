@@ -20,7 +20,7 @@
         "UIBackgroundModes": [
           "audio"
         ],
-        "NSMicrophoneUsageDescription": "Allow $(PRODUCT_NAME) to access your microphone"
+        "NSMicrophoneUsageDescription": "我们需要访问您的麦克风，以便通过语音拼读来练习英语单词。"
       }
     },
     "android": {
@@ -52,7 +52,7 @@
       [
         "expo-av",
         {
-          "microphonePermission": "Allow $(PRODUCT_NAME) to access your microphone"
+          "microphonePermission": "我们需要访问您的麦克风，以便通过语音拼读来练习英语单词。"
         }
       ]
     ],
